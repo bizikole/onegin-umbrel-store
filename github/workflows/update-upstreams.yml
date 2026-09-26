@@ -1,0 +1,210 @@
+name: Update upstream apps
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get upstream versions and update manifests
+        id: update
+        shell: python
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          import json
+          import os
+          import re
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+
+          ROOT = Path(".")
+
+          def gh_json(url):
+              req = Request(url, headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+                  "User-Agent": "onegin-umbrel-store-updater",
+              })
+              with urlopen(req, timeout=30) as r:
+                  return json.load(r)
+
+          def latest_release(owner, repo):
+              return gh_json(f"https://api.github.com/repos/{owner}/{repo}/releases/latest")
+
+          def set_first(text, pattern, repl):
+              new, n = re.subn(pattern, repl, text, count=1, flags=re.M)
+              if n != 1:
+                  raise RuntimeError(f"Pattern not found exactly once: {pattern}")
+              return new
+
+          changed = False
+          matrix_changed = False
+          matrix_tag = ""
+
+          # TorrServer official
+          rel = latest_release("YouROK", "TorrServer")
+          tag = rel["tag_name"]
+          m = re.fullmatch(r"MatriX\.(\d+)", tag)
+          if not m:
+              raise RuntimeError(f"Unexpected TorrServer tag: {tag}")
+          ver = f"{m.group(1)}.0.0"
+          p = ROOT / "onegin-torrserver/umbrel-app.yml"
+          s = p.read_text()
+          old = s
+          s = set_first(s, r'^version: ".*"$', f'version: "{ver}"')
+          s = set_first(s, r'Packaged from the upstream MatriX\.\d+ container image\.', f'Packaged from the upstream {tag} container image.')
+          p.write_text(s)
+          changed |= s != old
+          p = ROOT / "onegin-torrserver/docker-compose.yml"
+          s = p.read_text()
+          old = s
+          s = set_first(s, r'image: ghcr\.io/yourok/torrserver:MatriX\.\d+', f'image: ghcr.io/yourok/torrserver:{tag}')
+          p.write_text(s)
+          changed |= s != old
+
+          # Lampa
+          rel = latest_release("yumata", "lampa")
+          tag = rel["tag_name"]
+          ver = tag[1:] if tag.startswith("v") else tag
+          if not re.fullmatch(r"\d+\.\d+\.\d+", ver):
+              raise RuntimeError(f"Unexpected Lampa tag: {tag}")
+          p = ROOT / "onegin-lampa/umbrel-app.yml"
+          s = p.read_text(); old = s
+          s = set_first(s, r'^version: ".*"$', f'version: "{ver}"')
+          s = set_first(s, r'Uses the upstream Lampa .* portable web release\.', f'Uses the upstream Lampa {ver} portable web release.')
+          p.write_text(s); changed |= s != old
+          p = ROOT / "onegin-lampa/docker-compose.yml"
+          s = p.read_text(); old = s
+          s = set_first(s, r'version="[^"]+"', f'version="{ver}"')
+          p.write_text(s); changed |= s != old
+
+          # Homelable
+          rel = latest_release("Pouzor", "homelable")
+          tag = rel["tag_name"]
+          ver = tag[1:] if tag.startswith("v") else tag
+          if not re.fullmatch(r"\d+\.\d+\.\d+", ver):
+              raise RuntimeError(f"Unexpected Homelable tag: {tag}")
+          p = ROOT / "onegin-homelable/umbrel-app.yml"
+          s = p.read_text(); old = s
+          s = set_first(s, r'^version: ".*"$', f'version: "{ver}"')
+          s = set_first(s, r'Packaged from the upstream Homelable .* prebuilt GHCR images\.', f'Packaged from the upstream Homelable {ver} prebuilt GHCR images.')
+          p.write_text(s); changed |= s != old
+          p = ROOT / "onegin-homelable/docker-compose.yml"
+          s = p.read_text(); old = s
+          s = re.sub(r'ghcr\.io/pouzor/homelable-(backend|frontend):[0-9]+\.[0-9]+\.[0-9]+', lambda x: x.group(0).rsplit(':',1)[0] + ':' + ver, s)
+          p.write_text(s); changed |= s != old
+
+          # Stremio: find newest semver tag on Docker Hub, excluding latest.
+          req = Request(
+              "https://registry.hub.docker.com/v2/repositories/stremio/server/tags?page_size=100&ordering=last_updated",
+              headers={"Accept": "application/json", "User-Agent": "onegin-umbrel-store-updater"},
+          )
+          with urlopen(req, timeout=30) as r:
+              data = json.load(r)
+          candidates = []
+          for row in data.get("results", []):
+              name = row.get("name", "")
+              if re.fullmatch(r"\d+\.\d+\.\d+", name):
+                  candidates.append(name)
+          if not candidates:
+              raise RuntimeError("No semver Stremio server tags found on Docker Hub")
+          def vkey(x):
+              return tuple(map(int, x.split('.')))
+          stremio_ver = max(candidates, key=vkey)
+          p = ROOT / "onegin-stremio/umbrel-app.yml"
+          s = p.read_text(); old = s
+          s = set_first(s, r'^version: ".*"$', f'version: "{stremio_ver}"')
+          s = set_first(s, r'Uses the upstream stremio/server:latest image', f'Uses the upstream stremio/server:{stremio_ver} image')
+          p.write_text(s); changed |= s != old
+          p = ROOT / "onegin-stremio/docker-compose.yml"
+          s = p.read_text(); old = s
+          s = set_first(s, r'image: stremio/server:[^\n]+', f'image: stremio/server:{stremio_ver}')
+          p.write_text(s); changed |= s != old
+
+          # ByLampa Matrix UN build
+          rel = latest_release("bylampa", "Matrix")
+          matrix_tag = rel["tag_name"]
+          if not matrix_tag.endswith(".UN"):
+              raise RuntimeError(f"Latest ByLampa Matrix release is not a .UN build: {matrix_tag}")
+          mm = re.search(r"MatriX\.(\d+)", matrix_tag)
+          if not mm:
+              raise RuntimeError(f"Unexpected ByLampa Matrix tag: {matrix_tag}")
+          matrix_ver = f"{mm.group(1)}.0.0"
+          p = ROOT / "onegin-torrserver-un/umbrel-app.yml"
+          s = p.read_text(); old = s
+          s = set_first(s, r'^version: ".*"$', f'version: "{matrix_ver}"')
+          s = set_first(s, r'latest ByLampa MatriX UN release\.', f'latest ByLampa MatriX UN release ({matrix_tag}).')
+          p.write_text(s); changed |= s != old
+          p = ROOT / "onegin-torrserver-un/docker-compose.yml"
+          s = p.read_text(); old = s
+          s = set_first(s, r'image: ghcr\.io/bizikole/onegin-torrserver-un:[^\n]+', f'image: ghcr.io/bizikole/onegin-torrserver-un:{matrix_tag}')
+          p.write_text(s); changed |= s != old
+          df = ROOT / "onegin-torrserver-un/Dockerfile"
+          s = df.read_text(); old = s
+          s = set_first(s, r'^ARG MATRIX_TAG=.*$', f'ARG MATRIX_TAG={matrix_tag}')
+          df.write_text(s); matrix_changed = s != old
+
+          out = os.environ.get("GITHUB_OUTPUT")
+          if out:
+              with open(out, "a", encoding="utf-8") as f:
+                  f.write(f"changed={'true' if changed else 'false'}\n")
+                  f.write(f"matrix_changed={'true' if matrix_changed else 'false'}\n")
+                  f.write(f"matrix_tag={matrix_tag}\n")
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check whether Matrix UN image already exists
+        id: matrix-image
+        shell: bash
+        run: |
+          IMAGE="ghcr.io/bizikole/onegin-torrserver-un:${{ steps.update.outputs.matrix_tag }}"
+          if docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and publish ByLampa Matrix UN
+        if: steps.matrix-image.outputs.build == 'true' || steps.update.outputs.matrix_changed == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./onegin-torrserver-un
+          push: true
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          build-args: |
+            MATRIX_TAG=${{ steps.update.outputs.matrix_tag }}
+          tags: |
+            ghcr.io/bizikole/onegin-torrserver-un:${{ steps.update.outputs.matrix_tag }}
+            ghcr.io/bizikole/onegin-torrserver-un:latest
+
+      - name: Commit updated store
+        if: steps.update.outputs.changed == 'true'
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "chore: update upstream app versions"
+          git push

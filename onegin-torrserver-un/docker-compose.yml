@@ -1,0 +1,21 @@
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      APP_HOST: onegin-torrserver-un
+      APP_PORT: 8090
+
+  onegin-torrserver-un:
+    image: ghcr.io/bizikole/onegin-torrserver-un:bylampa_MatriX.145.UN
+    container_name: onegin-torrserver-un
+    restart: unless-stopped
+    environment:
+      TS_PORT: 8090
+      TS_PATH: /opt/ts/config
+      TS_TORRENTSDIR: /opt/ts/torrents
+      TS_DONTKILL: "1"
+    volumes:
+      - ${APP_DATA_DIR}/data:/opt/ts
+    ports:
+      - "8091:8090"

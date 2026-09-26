@@ -1,0 +1,21 @@
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      APP_HOST: onegin-stremio
+      APP_PORT: 11470
+      PROXY_AUTH_ADD: "false"
+
+  onegin-stremio:
+    image: stremio/server:4.21.0
+    container_name: onegin-stremio
+    restart: unless-stopped
+    environment:
+      NO_CORS: "1"
+      APP_PATH: /root/.stremio-server
+    volumes:
+      - ${APP_DATA_DIR}/data:/root/.stremio-server
+    ports:
+      - "11470:11470"
+      - "12470:12470"

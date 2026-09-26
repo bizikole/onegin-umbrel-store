@@ -1,0 +1,126 @@
+name: Update upstream apps
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Update manifests and image tags
+        id: update
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: python
+        run: |
+          import json, os, re
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+
+          token = os.environ["GITHUB_TOKEN"]
+
+          def gh(url):
+              req = Request(url, headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {token}",
+                  "User-Agent": "onegin-umbrel-store-updater",
+              })
+              with urlopen(req, timeout=30) as r:
+                  return json.load(r)
+
+          def docker_tags():
+              req = Request(
+                  "https://registry.hub.docker.com/v2/repositories/stremio/server/tags?page_size=100&ordering=last_updated",
+                  headers={"Accept": "application/json", "User-Agent": "onegin-umbrel-store-updater"},
+              )
+              with urlopen(req, timeout=30) as r:
+                  return [x["name"] for x in json.load(r).get("results", [])]
+
+          def replace(path, pattern, repl):
+              p = Path(path); s = p.read_text(); n = 0
+              ns = re.sub(pattern, repl, s, count=1, flags=re.M)
+              if ns != s: p.write_text(ns); return True
+              return False
+
+          changed = False
+
+          # TorrServer official
+          rel = gh("https://api.github.com/repos/YouROK/TorrServer/releases/latest")
+          tag = rel["tag_name"]
+          m = re.fullmatch(r"MatriX\.(\d+)", tag)
+          if not m: raise SystemExit(f"Unexpected TorrServer tag: {tag}")
+          v = f"{m.group(1)}.0.0"
+          changed |= replace("onegin-torrserver/umbrel-app.yml", r'^version: ".*"$', f'version: "{v}"')
+          changed |= replace("onegin-torrserver/umbrel-app.yml", r'Packaged from the upstream .*? container image\.', f'Packaged from the upstream {tag} container image.')
+          changed |= replace("onegin-torrserver/docker-compose.yml", r'image: ghcr\.io/yourok/torrserver:.*$', f'image: ghcr.io/yourok/torrserver:{tag}')
+
+          # Lampa
+          rel = gh("https://api.github.com/repos/yumata/lampa/releases/latest")
+          tag = rel["tag_name"]; v = tag[1:] if tag.startswith("v") else tag
+          if not re.fullmatch(r"\d+\.\d+\.\d+", v): raise SystemExit(f"Unexpected Lampa tag: {tag}")
+          if not any(a.get("name") == "lampa-portable.zip" for a in rel.get("assets", [])):
+              raise SystemExit(f"Lampa release {tag} has no lampa-portable.zip")
+          changed |= replace("onegin-lampa/umbrel-app.yml", r'^version: ".*"$', f'version: "{v}"')
+          changed |= replace("onegin-lampa/umbrel-app.yml", r'Uses the upstream Lampa .* portable web release\.', f'Uses the upstream Lampa {v} portable web release.')
+          changed |= replace("onegin-lampa/docker-compose.yml", r'version="[^"]+"', f'version="{v}"')
+
+          # Homelable
+          rel = gh("https://api.github.com/repos/Pouzor/homelable/releases/latest")
+          tag = rel["tag_name"]; v = tag[1:] if tag.startswith("v") else tag
+          if not re.fullmatch(r"\d+\.\d+\.\d+", v): raise SystemExit(f"Unexpected Homelable tag: {tag}")
+          changed |= replace("onegin-homelable/umbrel-app.yml", r'^version: ".*"$', f'version: "{v}"')
+          changed |= replace("onegin-homelable/umbrel-app.yml", r'Packaged from the upstream Homelable .* prebuilt GHCR images\.', f'Packaged from the upstream Homelable {v} prebuilt GHCR images.')
+          for service in ("backend", "frontend"):
+              changed |= replace(f"onegin-homelable/docker-compose.yml", rf'(ghcr\.io/pouzor/homelable-{service}:)[^\n]+', rf'\g<1>{v}')
+
+          # Stremio Server: Docker Hub uses v-prefixed semver tags.
+          tags = [x for x in docker_tags() if re.fullmatch(r"v\d+\.\d+\.\d+", x)]
+          if not tags: raise SystemExit("No semver Stremio tags found")
+          stag = max(tags, key=lambda x: tuple(map(int, x[1:].split("."))))
+          sv = stag[1:]
+          changed |= replace("onegin-stremio/umbrel-app.yml", r'^version: ".*"$', f'version: "{sv}"')
+          changed |= replace("onegin-stremio/umbrel-app.yml", r'Uses the upstream stremio/server:.* image\.', f'Uses the upstream stremio/server:{stag} image.')
+          changed |= replace("onegin-stremio/docker-compose.yml", r'image: stremio/server:.*$', f'image: stremio/server:{stag}')
+
+          # ByLampa Matrix UN — choose the highest release whose tag ends in .UN.
+          rels = gh("https://api.github.com/repos/bylampa/Matrix/releases?per_page=100")
+          candidates = []
+          for rel in rels:
+              t = rel.get("tag_name", "")
+              m = re.search(r"MatriX\.(\d+)\.UN$", t)
+              if m: candidates.append((int(m.group(1)), t))
+          if not candidates: raise SystemExit("No ByLampa Matrix .UN release found")
+          _, utag = max(candidates)
+          uv = re.search(r"MatriX\.(\d+)", utag).group(1) + ".0.0"
+          changed |= replace("onegin-torrserver-un/umbrel-app.yml", r'^version: ".*"$', f'version: "{uv}"')
+          changed |= replace("onegin-torrserver-un/docker-compose.yml", r'      MATRIX_TAG: .*$', f'      MATRIX_TAG: {utag}')
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"changed={'true' if changed else 'false'}\n")
+
+      - name: Validate YAML
+        if: always()
+        run: |
+          python - <<'PY'
+          import pathlib, yaml
+          for p in pathlib.Path('.').rglob('*.yml'):
+              with p.open() as f: yaml.safe_load(f)
+              print('OK', p)
+          PY
+
+      - name: Commit updates
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "chore: update upstream apps"
+          git push
